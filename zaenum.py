@@ -14,6 +14,7 @@ Everything is written to disk per zone. Re-running resumes where the last
 run stopped instead of re-fetching from the beginning.
 
 Usage
+  python3 zaenum.py                                 # interactive console
   python3 zaenum.py --sld all                       # every delegated .za SLD
   python3 zaenum.py --sld co.za --sources ct,cc
   python3 zaenum.py --sld example.com               # any TLD, not just .za
@@ -48,6 +49,7 @@ import socket
 import ssl
 import sys
 import time
+import traceback
 from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError, URLError
@@ -761,6 +763,345 @@ def discover(query: str, num_results: int, outdir: str) -> list:
 
 
 # --------------------------------------------------------------------------- #
+# interactive menu
+# --------------------------------------------------------------------------- #
+__version__ = "1.1.0"
+
+# Three-row block wordmark. Each glyph is a fixed width across its three rows,
+# so the assembled rows line up without hand-counting characters.
+GLYPHS = {
+    "Z": ("█▀▀█", " ▄▀ ", "█▄▄█"),
+    "A": ("▄▀▀▄", "█▄▄█", "█  █"),
+    "E": ("█▀▀▀", "█▀▀ ", "█▄▄▄"),
+    "N": ("█  █", "█▄ █", "█ ▀█"),
+    "U": ("█  █", "█  █", "█▄▄█"),
+    "M": ("█▄ ▄█", "█ ▀ █", "▀   ▀"),
+}
+WORDMARK = tuple(" ".join(GLYPHS[letter][row] for letter in "ZAENUM")
+                 for row in range(3))
+
+# Session defaults for the menu. Every one of these maps onto an existing flag,
+# so a menu run and the equivalent command line do exactly the same work.
+MENU_DEFAULTS = {"out": "out", "delay": 1.0, "timeout": 90, "retries": 5,
+                 "max_hosts": 0, "cdn_workers": 8, "discover_results": 5}
+
+MENU_ITEMS = (
+    ("01", "enumerate .za SLD", "crt.sh + common crawl for one SLD"),
+    ("02", "enumerate any domain", "same pipeline, any TLD"),
+    ("03", "enumerate every .za SLD", "all delegated SLDs, resumable"),
+    ("04", "CDN attribution only", "zone apex, no enumeration"),
+    ("05", "full sweep", "enumerate then tag each host's edge"),
+    ("06", "discover zones", "web search via Exa, needs EXA_API_KEY"),
+    ("07", "resolve hostnames", "best-effort IPv4 for saved hosts"),
+    ("08", "inspect last run", "counts and CDN tallies from disk"),
+    ("09", "settings", "output dir, delay, timeout, workers"),
+    ("10", "SLD reference", "delegated .za second-level domains"),
+)
+
+SETTING_ITEMS = (
+    ("1", "out", "output directory"),
+    ("2", "delay", "seconds between requests"),
+    ("3", "timeout", "per-request timeout (s)"),
+    ("4", "retries", "attempts per request"),
+    ("5", "max_hosts", "cap per zone, 0 = none"),
+    ("6", "cdn_workers", "concurrent CDN probes"),
+    ("7", "discover_results", "Exa results to request"),
+)
+
+
+def supports_color(stream=None) -> bool:
+    """Colour only for a real terminal that has not opted out."""
+    stream = stream if stream is not None else sys.stdout
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("TERM", "") == "dumb":
+        return False
+    try:
+        return bool(stream.isatty())
+    except Exception:
+        return False
+
+
+def palette(stream=None) -> dict:
+    """ANSI codes, or empty strings when colour is off, so callers stay branch-free."""
+    codes = {"reset": "0", "bold": "1", "dim": "2", "green": "38;5;46",
+             "dark": "38;5;28", "cyan": "38;5;51", "red": "38;5;203",
+             "amber": "38;5;214", "grey": "38;5;244"}
+    on = supports_color(stream)
+    return {name: (f"\033[{code}m" if on else "") for name, code in codes.items()}
+
+
+def coerce_setting(key: str, raw: str):
+    """Turn one typed menu value into a validated setting, or raise ValueError."""
+    if key not in MENU_DEFAULTS:
+        raise ValueError(f"unknown setting {key!r}")
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("value cannot be empty")
+    if key == "out":
+        if raw in {".", ".."}:
+            raise ValueError("pick a real directory name")
+        return raw
+    bounds = {"delay": (0.0, 600.0), "timeout": (1, 3600), "retries": (1, 50),
+              "max_hosts": (0, 100_000_000), "cdn_workers": (1, 128),
+              "discover_results": (1, 100)}
+    low, high = bounds[key]
+    try:
+        value = float(raw) if key == "delay" else int(raw)
+    except ValueError:
+        raise ValueError(f"{key} needs a number, got {raw!r}") from None
+    if not low <= value <= high:
+        raise ValueError(f"{key} must be between {low} and {high}")
+    return value
+
+
+def menu_command(choice, target: str = "", settings=None):
+    """Translate a menu selection into the argv main() already understands.
+
+    Returns None for choices the menu handles in-process (inspect, settings,
+    reference table, exit) so the caller never shells out to a half-built run.
+    """
+    cfg = dict(MENU_DEFAULTS)
+    if settings:
+        cfg.update(settings)
+    choice = str(choice).strip()
+    if choice in {"0", "8", "9", "10"}:
+        return None
+    if choice not in {"1", "2", "3", "4", "5", "6", "7"}:
+        raise ValueError(f"unknown menu choice {choice!r}")
+
+    base = ["--out", str(cfg["out"]), "--delay", str(cfg["delay"]),
+            "--timeout", str(cfg["timeout"]), "--retries", str(cfg["retries"]),
+            "--max-hosts", str(cfg["max_hosts"])]
+    probes = ["--cdn-workers", str(cfg["cdn_workers"])]
+
+    if choice == "3":
+        return ["--sld", "all"] + base
+    if choice == "6":
+        query = (target or "").strip()
+        if not query:
+            raise ValueError("discover needs a search phrase")
+        return ["--discover", query, "--discover-results",
+                str(cfg["discover_results"])] + base
+
+    zone = (target or "").strip().lower().lstrip(".").rstrip(".")
+    if not zone:
+        raise ValueError(f"option {choice} needs a zone")
+    if not HOST_RE.match(zone):
+        raise ValueError(f"not a valid zone: {target!r}")
+    if choice in {"1", "2"}:
+        return ["--sld", zone] + base
+    if choice == "4":
+        return ["--cdn-only", "--sld", zone] + base + probes
+    if choice == "5":
+        return ["--sld", zone, "--cdn"] + base + probes
+    return ["--sld", zone, "--resolve"] + base
+
+
+def _width() -> int:
+    try:
+        return max(56, min(78, os.get_terminal_size().columns - 2))
+    except OSError:
+        return 70
+
+
+def print_banner(settings, p):
+    width = max(len(line) for line in WORDMARK)
+    print()
+    print(f"  {p['dark']}┌{'─' * (width + 2)}┐{p['reset']}")
+    for line in WORDMARK:
+        print(f"  {p['dark']}│{p['reset']} {p['green']}{p['bold']}{line.ljust(width)}{p['reset']} "
+              f"{p['dark']}│{p['reset']}")
+    print(f"  {p['dark']}└{'─' * (width + 2)}┘{p['reset']}")
+    stamp = time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime())
+    print(f"  {p['grey']}zone enumeration // edge attribution  v{__version__}{p['reset']}")
+    print(f"  {p['grey']}{stamp}   out={settings['out']}   delay={settings['delay']}s"
+          f"   timeout={settings['timeout']}s   retries={settings['retries']}{p['reset']}")
+
+
+def print_menu(p):
+    print()
+    for key, label, note in MENU_ITEMS:
+        print(f"  {p['green']}[{key}]{p['reset']} {p['bold']}{label:<26}{p['reset']}"
+              f"{p['grey']}{note}{p['reset']}")
+    print(f"  {p['red']}[00]{p['reset']} {p['bold']}{'exit':<26}{p['reset']}"
+          f"{p['grey']}leave the console{p['reset']}")
+
+
+def _ask(p, label: str, default: str = ""):
+    """One line of input; returns None on EOF so callers can exit cleanly."""
+    hint = f" [{default}]" if default not in ("", None) else ""
+    try:
+        raw = input(f"\n  {p['cyan']}zaenum ❯{p['reset']} {label}{hint}: ")
+    except EOFError:
+        return None
+    raw = raw.strip()
+    return raw or str(default)
+
+
+def _pause(p):
+    try:
+        input(f"\n  {p['dark']}enter to return to console{p['reset']} ")
+    except EOFError:
+        return False
+    return True
+
+
+def _execute(argv, settings, p):
+    print(f"\n  {p['dark']}{'-' * _width()}{p['reset']}")
+    print(f"  {p['green']}target loadout{p['reset']} {p['grey']}zaenum {shlex_join(argv)}{p['reset']}")
+    print(f"  {p['dark']}{'-' * _width()}{p['reset']}\n")
+    try:
+        code = main(list(argv))
+    except KeyboardInterrupt:
+        print(f"\n  {p['amber']}interrupted -- progress is saved, rerun to resume{p['reset']}")
+        return 130
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    except Exception:
+        print(f"\n  {p['red']}run failed:{p['reset']}")
+        traceback.print_exc()
+        return 1
+    return code
+
+
+def shlex_join(argv) -> str:
+    """Readable one-line command echo, without importing shlex for one call site."""
+    parts = []
+    for item in argv:
+        parts.append(f'"{item}"' if (not item or " " in item) else str(item))
+    return " ".join(parts)
+
+
+def menu_status(out_dir, p) -> bool:
+    path = os.path.join(out_dir, "summary.json")
+    if not os.path.exists(path):
+        print(f"\n  {p['amber']}no summary.json in {out_dir!r} -- run a sweep first{p['reset']}")
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            summary = json.load(handle)
+    except (OSError, ValueError) as exc:
+        print(f"\n  {p['red']}cannot read {path}: {exc}{p['reset']}")
+        return False
+
+    zones = summary.get("slds") or {}
+    print(f"\n  {p['bold']}last run{p['reset']} {p['grey']}{summary.get('generated', '?')}"
+          f"   aggregate {summary.get('aggregate', 0)} hosts{p['reset']}")
+    print(f"  {p['dark']}{'-' * _width()}{p['reset']}")
+    print(f"  {'zone':<24}{'hosts':>8}  {'cdn':<28}")
+    for zone in sorted(zones):
+        info = zones[zone] or {}
+        tallies = info.get("cdn") or {}
+        top = ", ".join(f"{name} {count}" for name, count
+                        in sorted(tallies.items(), key=lambda kv: (-kv[1], kv[0]))[:3])
+        print(f"  {zone:<24}{info.get('total', 0):>8}  {top or '-'}")
+    if not zones:
+        print(f"  {p['grey']}no zones recorded yet{p['reset']}")
+    return True
+
+
+def menu_settings(settings, p) -> None:
+    while True:
+        print(f"\n  {p['bold']}settings{p['reset']}")
+        for key, name, note in SETTING_ITEMS:
+            print(f"  {p['green']}[{key}]{p['reset']} {name:<18}{settings[name]:<12}"
+                  f"{p['grey']}{note}{p['reset']}")
+        choice = _ask(p, "setting to change, 0 to go back", "0")
+        if choice is None or choice == "0":
+            return
+        name = dict((key, name) for key, name, _ in SETTING_ITEMS).get(choice)
+        if not name:
+            print(f"  {p['red']}no setting {choice!r}{p['reset']}")
+            continue
+        raw = _ask(p, f"new {name}", str(settings[name]))
+        if raw is None:
+            return
+        try:
+            settings[name] = coerce_setting(name, raw)
+        except ValueError as exc:
+            print(f"  {p['red']}{exc}{p['reset']}")
+            continue
+        print(f"  {p['green']}{name} = {settings[name]}{p['reset']}")
+
+
+def menu_table(p) -> None:
+    width = max(len(sld) for sld in SLD_INFO)
+    print()
+    for sld, desc in SLD_INFO.items():
+        print(f"  {p['green']}{sld:<{width}}{p['reset']}  {p['grey']}{desc}{p['reset']}")
+
+
+def run_menu() -> int:
+    settings = dict(MENU_DEFAULTS)
+    p = palette()
+    while True:
+        print_banner(settings, p)
+        print_menu(p)
+        choice = _ask(p, "selection")
+        if choice is None:
+            print("\n  no interactive input -- run with -h for the flag interface")
+            return 0
+        choice = choice.lower()
+        if not choice:
+            continue
+        if choice in {"0", "00", "q", "quit", "exit"}:
+            print(f"\n  {p['dark']}session closed{p['reset']}\n")
+            return 0
+        if choice in {"8", "08"}:
+            menu_status(settings["out"], p)
+            if not _pause(p):
+                return 0
+            continue
+        if choice in {"9", "09"}:
+            menu_settings(settings, p)
+            continue
+        if choice in {"10", "010"}:
+            menu_table(p)
+            if not _pause(p):
+                return 0
+            continue
+
+        if choice in {"1", "01"}:
+            print(f"\n  {p['grey']}delegated .za SLDs: {', '.join(SLD_INFO)}{p['reset']}")
+            target = _ask(p, "SLD", "co.za")
+        elif choice in {"2", "02"}:
+            target = _ask(p, "domain", "example.com")
+        elif choice in {"3", "03"}:
+            target = ""
+        elif choice in {"4", "04", "5", "05", "7", "07"}:
+            target = _ask(p, "zone", "example.com")
+        elif choice in {"6", "06"}:
+            target = _ask(p, "search phrase", "south african universities")
+        else:
+            print(f"  {p['red']}no option {choice!r}{p['reset']}")
+            continue
+        if target is None:
+            return 0
+        if choice in {"3", "03"}:
+            confirm = _ask(p, "all 17 SLDs, this takes a while -- continue? (y/N)", "n")
+            if confirm is None:
+                return 0
+            if confirm.lower() not in {"y", "yes"}:
+                continue
+
+        try:
+            argv = menu_command(choice, target, settings)
+        except ValueError as exc:
+            print(f"  {p['red']}{exc}{p['reset']}")
+            continue
+        if argv is None:
+            continue
+
+        code = _execute(argv, settings, p)
+        colour = "green" if code == 0 else "red"
+        print(f"\n  {p[colour]}exit {code}{p['reset']} {p['grey']}-- artifacts in "
+              f"{settings['out']}/{p['reset']}")
+        if not _pause(p):
+            return 0
+
+
+# --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
 def parse_args(argv=None):
@@ -803,10 +1144,19 @@ def parse_args(argv=None):
     parser.add_argument("--discover-only", action="store_true",
                         help="with --discover, list and save the results without enumerating")
     parser.add_argument("--list-slds", action="store_true", help="print the SLD table")
+    parser.add_argument("--menu", action="store_true",
+                        help="open the interactive console (the default with no flags)")
+    parser.add_argument("--version", action="version", version=f"zaenum {__version__}",
+                        help="print the version and exit")
     return parser.parse_args(argv)
 
 
 def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # No flags, or an explicit --menu: the console is the front door. Every
+    # action it offers is translated into the same argv a CLI run would use.
+    if not argv or argv[0] == "--menu":
+        return run_menu()
     args = parse_args(argv)
 
     if args.list_slds:
