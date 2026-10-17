@@ -272,5 +272,102 @@ class DiscoverTests(unittest.TestCase):
         self.assertIn("requirements.txt", str(caught.exception))
 
 
+class MenuTests(unittest.TestCase):
+    """The console must build exactly the argv the flag interface documents."""
+
+    def test_plain_selection_maps_to_enumerate_flags(self):
+        argv = zaenum.menu_command("1", "co.za")
+        self.assertEqual(argv[:2], ["--sld", "co.za"])
+        self.assertIn("--out", argv)
+        self.assertNotIn("--cdn", argv)
+
+    def test_zone_is_normalised(self):
+        self.assertEqual(zaenum.menu_command("2", "  .Example.COM. ")[:2],
+                         ["--sld", "example.com"])
+
+    def test_all_slds_needs_no_zone(self):
+        self.assertEqual(zaenum.menu_command("3")[:2], ["--sld", "all"])
+
+    def test_cdn_only_and_full_sweep_differ_by_one_flag(self):
+        only = zaenum.menu_command("4", "example.com")
+        sweep = zaenum.menu_command("5", "example.com")
+        self.assertIn("--cdn-only", only)
+        self.assertNotIn("--cdn", only)
+        self.assertIn("--cdn", sweep)
+        self.assertNotIn("--cdn-only", sweep)
+        self.assertEqual([a for a in sweep if a.startswith("--cdn")],
+                         ["--cdn", "--cdn-workers"])
+
+    def test_discover_passes_the_query_through(self):
+        argv = zaenum.menu_command("6", "  south african banks ")
+        self.assertEqual(argv[:2], ["--discover", "south african banks"])
+        self.assertIn("--discover-results", argv)
+
+    def test_resolve_selection(self):
+        self.assertIn("--resolve", zaenum.menu_command("7", "law.za"))
+
+    def test_settings_reach_the_command_line(self):
+        argv = zaenum.menu_command("1", "co.za", {"out": "runs/za", "delay": 2.5,
+                                                   "max_hosts": 250})
+        self.assertEqual(argv[argv.index("--out") + 1], "runs/za")
+        self.assertEqual(argv[argv.index("--delay") + 1], "2.5")
+        self.assertEqual(argv[argv.index("--max-hosts") + 1], "250")
+
+    def test_in_process_choices_return_none(self):
+        for choice in ("0", "8", "9", "10"):
+            self.assertIsNone(zaenum.menu_command(choice))
+
+    def test_bad_input_is_rejected_not_guessed(self):
+        with self.assertRaises(ValueError):
+            zaenum.menu_command("1", "")
+        with self.assertRaises(ValueError):
+            zaenum.menu_command("1", "not a host")
+        with self.assertRaises(ValueError):
+            zaenum.menu_command("6", "   ")
+        with self.assertRaises(ValueError):
+            zaenum.menu_command("99")
+
+    def test_setting_coercion(self):
+        self.assertEqual(zaenum.coerce_setting("delay", "0.5"), 0.5)
+        self.assertEqual(zaenum.coerce_setting("retries", "3"), 3)
+        self.assertEqual(zaenum.coerce_setting("out", "runs/za"), "runs/za")
+        for key, raw in (("retries", "0"), ("delay", "-1"), ("cdn_workers", "many"),
+                         ("out", ""), ("max_hosts", "1e9"), ("nope", "1")):
+            with self.assertRaises(ValueError, msg=f"{key}={raw!r}"):
+                zaenum.coerce_setting(key, raw)
+
+    def test_colour_can_be_disabled(self):
+        class FakeTty:
+            def isatty(self):
+                return True
+
+        self.assertEqual(zaenum.palette(FakeTty())["green"], "\033[38;5;46m")
+        saved = os.environ.get("NO_COLOR")
+        os.environ["NO_COLOR"] = "1"
+        try:
+            self.assertEqual(zaenum.palette(FakeTty())["green"], "")
+        finally:
+            if saved is None:
+                os.environ.pop("NO_COLOR", None)
+            else:
+                os.environ["NO_COLOR"] = saved
+
+    def test_plain_stream_gets_no_escape_codes(self):
+        class NotATty:
+            def isatty(self):
+                return False
+
+        self.assertEqual(set(zaenum.palette(NotATty()).values()), {""})
+
+    def test_banner_lines_are_the_same_width(self):
+        self.assertEqual(len({len(line) for line in zaenum.WORDMARK}), 1)
+        for letter, rows in zaenum.GLYPHS.items():
+            self.assertEqual(len({len(row) for row in rows}), 1, f"glyph {letter} is ragged")
+            self.assertEqual(len(rows), 3, f"glyph {letter} is not three rows")
+
+    def test_menu_labels_stay_aligned(self):
+        self.assertLessEqual(max(len(label) for _, label, _ in zaenum.MENU_ITEMS), 26)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
