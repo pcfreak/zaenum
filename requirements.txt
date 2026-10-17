@@ -1,0 +1,2 @@
+# Only --discover needs this; every other flag runs on the stdlib alone.
+exa-py==2.25.0
