@@ -13,6 +13,51 @@ rather than starting over.
 stdlib only, Python 3.8+ — except `--discover`, which needs `exa-py` from
 `requirements.txt` and an Exa API key.
 
+## Console
+
+Run it with no arguments and you get an interactive console instead of a run:
+
+```bash
+python3 zaenum.py            # menu
+python3 zaenum.py --menu     # same, explicitly
+```
+
+```
+  ┌────────────────────────────────┐
+  │ █▀▀█ ▄▀▀▄ █▀▀▀ █  █ █  █ █▄ ▄█ │
+  │  ▄▀  █▄▄█ █▀▀  █▄ █ █  █ █ ▀ █ │
+  │ █▄▄█ █  █ █▄▄▄ █ ▀█ █▄▄█ ▀   ▀ │
+  └────────────────────────────────┘
+  zone enumeration // edge attribution  v1.1.0
+  2026-10-17 18:40:22Z   out=out   delay=1.0s   timeout=90s   retries=5
+
+  [01] enumerate .za SLD         crt.sh + common crawl for one SLD
+  [02] enumerate any domain      same pipeline, any TLD
+  [03] enumerate every .za SLD   all delegated SLDs, resumable
+  [04] CDN attribution only      zone apex, no enumeration
+  [05] full sweep                enumerate then tag each host's edge
+  [06] discover zones            web search via Exa, needs EXA_API_KEY
+  [07] resolve hostnames         best-effort IPv4 for saved hosts
+  [08] inspect last run          counts and CDN tallies from disk
+  [09] settings                  output dir, delay, timeout, workers
+  [10] SLD reference             delegated .za second-level domains
+  [00] exit                      leave the console
+```
+
+The menu is a front end, not a second implementation: every selection is turned
+into the same argv a command-line run would use, and the exact command is echoed
+above the output (`zaenum --cdn-only --sld example.com --out out ...`). Anything
+the menu can do, you can type as flags, and vice versa.
+
+`09 settings` changes `--out`, `--delay`, `--timeout`, `--retries`, `--max-hosts`,
+`--cdn-workers` and `--discover-results` for the session; the values are echoed in
+the header so you can always see what a run will use. `08 inspect last run` reads
+`out/summary.json` and prints per-zone totals with CDN tallies. Colour is on only
+for a real terminal and is disabled by `NO_COLOR`, so piped output stays plain.
+
+Any flags bypass the menu entirely — the console never wraps or hides the flag
+interface.
+
 ## Usage
 
 ```bash
@@ -56,7 +101,8 @@ reported as such rather than as an empty result list.
 
 Useful flags: `--delay` (seconds between requests, default 1.0), `--timeout`
 (default 90), `--retries` (default 5), `--max-hosts` (cap per zone),
-`--cdn-workers` (default 8), `--cdn-timeout` (default 8), `--out` (default `out`).
+`--cdn-workers` (default 8), `--cdn-timeout` (default 8), `--out` (default `out`),
+`--version`, `--menu`.
 
 ## Output
 
@@ -162,5 +208,7 @@ python3 -m unittest discover -s tests -v
 
 Offline, with a faked transport: host normalisation, CT error-vs-empty
 semantics, CC pagination with a mid-walk failure and resume, new-collection
-restart, store dedupe across runs, CDN range lookup, and the header/CNAME
-fingerprint rules for each provider.
+restart, store dedupe across runs, CDN range lookup, the header/CNAME
+fingerprint rules for each provider, and the console's menu-to-argv mapping
+(each selection is checked against the flags it must produce, and bad input
+must raise rather than guess). 34 tests, no network.
