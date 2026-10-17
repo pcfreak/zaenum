@@ -48,7 +48,13 @@ Git works too, since the repo is public and needs no credentials:
 
 ```bash
 git clone https://github.com/pcfreak/zaenum.git && cd zaenum
+sh install.sh          # note: `sh`, not `./install.sh` -- see below
 ```
+
+From a checkout, invoke the installer as `sh install.sh`: the file is committed
+without the executable bit (it is uploaded through the API, which cannot set
+file modes), so `./install.sh` stops with exit 126. The `curl ... | sh` form in
+the section above is unaffected.
 
 ## Console
 
