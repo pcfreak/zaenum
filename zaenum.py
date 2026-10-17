@@ -31,7 +31,7 @@ Output (default ./out)
   .cdn-ranges.json     cached CDN IP ranges (7 day TTL)
   <zone>.resolved.txt  host -> IPv4 pairs, only with --resolve
 
-stdio only, Python 3.8+, except --discover which needs exa-py
+stdlib only, Python 3.8+, except --discover which needs exa-py
 (requirements.txt) and an EXA_API_KEY.
 """
 
