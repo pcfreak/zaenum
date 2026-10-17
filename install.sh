@@ -1,0 +1,164 @@
+#!/bin/sh
+# zaenum installer -- no git, no tokens, no sudo, no root.
+#
+#   curl -fsSL https://raw.githubusercontent.com/pcfreak/zaenum/main/install.sh | sh
+#
+# Options, when piped as `... | sh -s -- <options>`:
+#   --dir DIR     where zaenum.py and friends live   (default: ~/.zaenum)
+#   --bin DIR     where the `zaenum` command goes    (default: $PREFIX/bin on
+#                 Termux, otherwise ~/.local/bin)
+#   --uninstall   remove the files this script installed, nothing else
+#   -h, --help    this text
+#
+# Re-running it is the update path: files are replaced in place.
+set -eu
+
+RAW="${ZAENUM_RAW:-https://raw.githubusercontent.com/pcfreak/zaenum/main}"
+FILES="zaenum.py exa_search.py requirements.txt"
+
+home_dir="${ZAENUM_HOME:-$HOME/.zaenum}"
+
+# Termux exposes $PREFIX=/data/data/com.termux/files/usr, whose bin/ is already on
+# PATH, so that wins whenever it exists and is writable. Everywhere else
+# ~/.local/bin is the convention, which keeps this install root-free.
+bin_dir="${HOME}/.local/bin"
+if [ -n "${PREFIX:-}" ] && [ -d "${PREFIX}/bin" ] && [ -w "${PREFIX}/bin" ]; then
+    bin_dir="${PREFIX}/bin"
+fi
+
+uninstall=0
+
+usage() {
+    sed -n '2,17p' "$0" 2>/dev/null || cat <<'TEXT'
+zaenum installer -- no git, no tokens, no sudo.
+
+  curl -fsSL https://raw.githubusercontent.com/pcfreak/zaenum/main/install.sh | sh
+
+Options: --dir DIR, --bin DIR, --uninstall, -h
+TEXT
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --dir) [ "$#" -ge 2 ] || { echo "--dir needs a path" >&2; exit 2; }
+               home_dir="$2"; shift 2 ;;
+        --bin) [ "$#" -ge 2 ] || { echo "--bin needs a path" >&2; exit 2; }
+               bin_dir="$2"; shift 2 ;;
+        --uninstall) uninstall=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
+    esac
+done
+
+say() { printf '%s\n' "$*"; }
+fail() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
+
+# --------------------------------------------------------------------------- #
+# uninstall
+# --------------------------------------------------------------------------- #
+if [ "$uninstall" -eq 1 ]; then
+    if [ -f "${bin_dir}/zaenum" ]; then
+        rm -f "${bin_dir}/zaenum"
+        say "removed ${bin_dir}/zaenum"
+    fi
+    if [ -d "$home_dir" ]; then
+        rm -rf "$home_dir"
+        say "removed ${home_dir}"
+    fi
+    say "done -- your out/ scan results were not touched"
+    exit 0
+fi
+
+# --------------------------------------------------------------------------- #
+# prerequisites
+# --------------------------------------------------------------------------- #
+command -v python3 >/dev/null 2>&1 || fail "python3 not found -- run: pkg install python   (Debian/Ubuntu: apt install python3)"
+
+# One downloader, in order of preference. curl and wget are optional; python3 is
+# not, so it is the guaranteed fallback and the reason this works on a bare
+# Termux where curl may be missing.
+fetch() {
+    tool="${ZAENUM_FETCH:-auto}"
+    if [ "$tool" = "auto" ]; then
+        if command -v curl >/dev/null 2>&1; then
+            tool=curl
+        elif command -v wget >/dev/null 2>&1; then
+            tool=wget
+        else
+            tool=python
+        fi
+    fi
+    case "$tool" in
+        curl)   curl -fsSL --retry 2 "$1" ;;
+        wget)   wget -qO- --tries=2 "$1" ;;
+        python) python3 - "$1" <<'PY'
+import sys
+import urllib.request
+
+url = sys.argv[1]
+request = urllib.request.Request(url, headers={"User-Agent": "zaenum-installer"})
+with urllib.request.urlopen(request, timeout=60) as response:
+    sys.stdout.buffer.write(response.read())
+PY
+            ;;
+        *) fail "unknown ZAENUM_FETCH=$tool -- use auto, curl, wget or python" ;;
+    esac
+}
+
+# --------------------------------------------------------------------------- #
+# install
+# --------------------------------------------------------------------------- #
+mkdir -p "$home_dir" || fail "cannot create ${home_dir}"
+mkdir -p "$bin_dir" 2>/dev/null || true
+
+say "zaenum installer"
+say "  source  ${RAW}"
+say "  files   ${home_dir}"
+say "  command ${bin_dir}/zaenum"
+say ""
+
+for file in $FILES; do
+    part="${home_dir}/.${file}.part"
+    # exa_search.py and requirements.txt are only needed by --discover, so a
+    # failure there is reported but must not sink the whole install.
+    if fetch "${RAW}/${file}" > "$part" 2>/dev/null && [ -s "$part" ]; then
+        mv "$part" "${home_dir}/${file}"
+    else
+        rm -f "$part"
+        if [ "$file" = "zaenum.py" ]; then
+            fail "could not download ${RAW}/${file} -- check your connection, then try again"
+        fi
+        say "  note: ${file} skipped (only --discover needs it)"
+    fi
+done
+
+chmod 644 "${home_dir}/zaenum.py"
+if ! version=$(python3 "${home_dir}/zaenum.py" --version 2>&1); then
+    fail "downloaded zaenum.py does not run -- ${version}"
+fi
+say "  installed ${version}"
+
+cat > "${bin_dir}/zaenum" <<LAUNCHER
+#!/bin/sh
+# Generated by zaenum install.sh -- re-run the installer to update.
+exec python3 "${home_dir}/zaenum.py" "\$@"
+LAUNCHER
+chmod 755 "${bin_dir}/zaenum"
+
+case ":${PATH}:" in
+    *":${bin_dir}:"*) ;;
+    *)
+        say ""
+        say "  ${bin_dir} is not on your PATH yet. Add it once:"
+        say "    export PATH=\"${bin_dir}:\$PATH\""
+        say "  or keep calling it as ${bin_dir}/zaenum"
+        ;;
+esac
+
+say ""
+say "next:"
+say "  zaenum              # the console"
+say "  zaenum --list-slds  # every flag still works"
+say "  zaenum --discover \"south african universities\"   # needs: pip install -r ${home_dir}/requirements.txt and EXA_API_KEY"
+say ""
+say "update: re-run this installer.   remove: add --uninstall"
