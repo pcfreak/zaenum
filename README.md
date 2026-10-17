@@ -13,6 +13,43 @@ rather than starting over.
 stdlib only, Python 3.8+ — except `--discover`, which needs `exa-py` from
 `requirements.txt` and an Exa API key.
 
+## Install
+
+One command, no git, no token, no root — Termux, Linux or macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pcfreak/zaenum/main/install.sh | sh
+```
+
+It downloads `zaenum.py`, `exa_search.py` and `requirements.txt` into `~/.zaenum`,
+writes a `zaenum` launcher into `$PREFIX/bin` on Termux (elsewhere
+`~/.local/bin`), checks that the downloaded script actually runs, and prints the
+single `export PATH=...` line if that directory is not on your `PATH` yet.
+
+```bash
+zaenum                  # the console
+zaenum --list-slds      # flags work exactly as documented below
+```
+
+Re-running the installer is the update path; it replaces the files in place.
+`--dir` and `--bin` move the two destinations, and `--uninstall` removes just
+what it installed. When piped, pass options after `sh -s --`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pcfreak/zaenum/main/install.sh \
+  | sh -s -- --uninstall
+```
+
+It uses `curl`, `wget` or — if neither exists, as on a bare Termux install —
+python's own HTTP client, so it needs nothing but `python3`. A failed download
+exits non-zero and never leaves a half-written `zaenum.py` behind.
+
+Git works too, since the repo is public and needs no credentials:
+
+```bash
+git clone https://github.com/pcfreak/zaenum.git && cd zaenum
+```
+
 ## Console
 
 Run it with no arguments and you get an interactive console instead of a run:
