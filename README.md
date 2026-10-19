@@ -7,8 +7,24 @@ rather than starting over.
 
 | Source | What it gives | Weakness |
 |---|---|---|
-| `ct` — Certificate Transparency via crt.sh | anything serving TLS, including internal-ish names (mail, autodiscover, vpn) | 502s on very large zones; TLS hosts only |
+| `ct` — Certificate Transparency via crt.sh | anything serving TLS, including internal-ish names (mail, autodiscover, vpn) | 502s on very large zones, and sometimes on *every* query for hours |
+| `cdx` — Wayback Machine CDX index | hostnames from every archived URL, paginated and resumable | page budget (`--cdx-max-pages`), so very large zones are sampled, not exhaustive |
 | `cc` — Common Crawl URL index | hostnames seen in crawled URLs, with pagination | index 504s on whole-zone wildcards for big zones |
+
+All three are on by default (`--sources ct,cdx,cc`) because they fail
+independently. When crt.sh is down, `cdx` still finds hosts: a `web.za` run that
+returned nothing from CT produced 932 hostnames from Wayback.
+
+**A failing source is dropped, not retried forever.** After two requests fail
+exhausted, that source is skipped for the rest of the run and the zones it left
+behind are reported as incomplete. A run that lost a source exits **3**, so an
+outage can never be mistaken for a zone that simply has no hostnames:
+
+```
+[19:15:37] incomplete: 1 of 1 zone(s) lost a source
+[19:15:37]   web.za: cc, ct
+[19:15:37] rerun to resume; per-source detail in out/summary.json
+```
 
 stdlib only, Python 3.8+ — except `--discover`, which needs `exa-py` from
 `requirements.txt` and an Exa API key.
@@ -71,10 +87,10 @@ python3 zaenum.py --menu     # same, explicitly
   │  ▄▀  █▄▄█ █▀▀  █▄ █ █  █ █ ▀ █ │
   │ █▄▄█ █  █ █▄▄▄ █ ▀█ █▄▄█ ▀   ▀ │
   └────────────────────────────────┘
-  zone enumeration // edge attribution  v1.1.0
+  zone enumeration // edge attribution  v1.2.0
   2026-10-17 18:40:22Z   out=out   delay=1.0s   timeout=90s   retries=5
 
-  [01] enumerate .za SLD         crt.sh + common crawl for one SLD
+  [01] enumerate .za SLD         ct + wayback + crawl for one SLD
   [02] enumerate any domain      same pipeline, any TLD
   [03] enumerate every .za SLD   all delegated SLDs, resumable
   [04] CDN attribution only      zone apex, no enumeration
@@ -95,8 +111,9 @@ the menu can do, you can type as flags, and vice versa.
 `09 settings` changes `--out`, `--delay`, `--timeout`, `--retries`, `--max-hosts`,
 `--cdn-workers` and `--discover-results` for the session; the values are echoed in
 the header so you can always see what a run will use. `08 inspect last run` reads
-`out/summary.json` and prints per-zone totals with CDN tallies. Colour is on only
-for a real terminal and is disabled by `NO_COLOR`, so piped output stays plain.
+`out/summary.json` and prints per-zone totals, each source's state (`ct:com`,
+`cdx:cap`, `cc: fai`) and any zones left incomplete. Colour is on only for a real
+terminal and is disabled by `NO_COLOR`, so piped output stays plain.
 
 Any flags bypass the menu entirely — the console never wraps or hides the flag
 interface.
@@ -142,10 +159,13 @@ on the machine running the CLI. It is never printed, logged or written to
 key, a rejected key (401), exhausted credits (402) and rate limits (429) are
 reported as such rather than as an empty result list.
 
-Useful flags: `--delay` (seconds between requests, default 1.0), `--timeout`
-(default 90), `--retries` (default 5), `--max-hosts` (cap per zone),
-`--cdn-workers` (default 8), `--cdn-timeout` (default 8), `--out` (default `out`),
-`--version`, `--menu`.
+Useful flags: `--sources` (default `ct,cdx,cc`), `--delay` (seconds between
+requests, default 1.0), `--timeout` (default 90), `--retries` (default 5),
+`--max-backoff` (retry sleep cap, default 8 s — it used to reach 23 s),
+`--cdx-max-pages` (Wayback pages per zone, default 20, `0` = all),
+`--max-hosts` (cap per zone), `--cdn-workers` (default 8), `--cdn-timeout`
+(default 8), `--out` (default `out`), `--allow-partial` (exit 0 despite
+incomplete zones), `--version`, `--menu`.
 
 ## Output
 
@@ -155,7 +175,7 @@ out/
   <zone>.cdn.tsv        host, provider, evidence, IP   (--cdn)
   <zone>.resolved.txt   host -> IPv4                   (--resolve)
   all.hosts.txt         union across every zone in this run
-  summary.json          counts, CDN tallies, per-source state
+  summary.json          counts, CDN tallies, per-source state, incomplete zones
   .state.json           resume cursors (delete to start over)
   .cdn-ranges.json      cached CDN IP ranges, 7 day TTL
 ```
@@ -217,23 +237,31 @@ path. What differs is tractability, not support:
 
 ## Resume semantics
 
-State commits after each completed unit — one crt.sh response or one Common
-Crawl page — so an interrupted run loses at most a single page. CDN results are
-appended to the TSV and re-read on the next run, so classification is also
-incremental; a host is never probed twice.
+State commits after each completed unit — one crt.sh response, or one Wayback or
+Common Crawl page — so an interrupted run loses at most a single page. CDN
+results are appended to the TSV and re-read on the next run, so classification is
+also incremental; a host is never probed twice.
 
 The important distinction the code makes: **a transient error is never recorded
-as "done"**. A 502, a 504, a timeout or an HTML maintenance page leaves the zone
-resumable. Only a real answer does — a parsed JSON array for `ct` (including
-`[]`), or `pages`/`No Captures` for `cc`. If a new Common Crawl collection
-appears, that zone restarts, since the old cursor indexes different data.
+as "done"**. A 502, a 504, a timeout, a truncated chunked body or an HTML
+maintenance page leaves the zone resumable. Only a real answer does — a parsed
+JSON array for `ct` (including `[]`), `pages`/`No Captures` for `cc`, or a page
+count/number for `cdx`. If a new Common Crawl collection appears, that zone
+restarts, since the old cursor indexes different data.
+
+`cdx` stopping at `--cdx-max-pages` is recorded as `capped`, not `complete`, so
+raising the budget on the next run continues from that cursor instead of
+pretending the index was exhausted.
 
 ## Limits worth knowing
 
-- **Big zones are not tractable this way.** `crt.sh` returns 502 for `%.co.za`,
-  and the Common Crawl index 504s on `url=*.org.za`. Both stay resumable, so
-  nothing is silently lost, but you won't complete `co.za` with these two
-  sources alone.
+- **crt.sh can be down entirely.** It returns 502 for *every* query during an
+  outage, not just large zones; `cdx` and `cc` keep the run useful meanwhile.
+- **Big zones are sampled, not exhausted.** `--cdx-max-pages 20` reads roughly
+  80–100k archived URLs per zone; `co.za` has ~70k Wayback pages at
+  `pageSize=5`. Raise the budget for a longer, still-resumable walk.
+- **A partially covered zone exits 3.** Use `--allow-partial` when a scripted
+  run should treat that as success.
 - **Per-domain zones work well** — `--sld somecompany.co.za` succeeds where
   `--sld co.za` fails.
 - **For registry-scale coverage**, Rapid7 Open Data's forward-DNS datasets are
@@ -250,8 +278,10 @@ python3 -m unittest discover -s tests -v
 ```
 
 Offline, with a faked transport: host normalisation, CT error-vs-empty
-semantics, CC pagination with a mid-walk failure and resume, new-collection
-restart, store dedupe across runs, CDN range lookup, the header/CNAME
-fingerprint rules for each provider, and the console's menu-to-argv mapping
-(each selection is checked against the flags it must produce, and bad input
-must raise rather than guess). 34 tests, no network.
+semantics, CC and Wayback pagination with a mid-walk failure and resume, the
+Wayback page budget staying resumable, new-collection restart, truncated-body
+retry, the source breaker, store dedupe across runs, CDN range lookup, the
+header/CNAME fingerprint rules for each provider, incomplete-run exit codes, and
+the console's menu-to-argv mapping (each selection is checked against the flags
+it must produce, and bad input must raise rather than guess). 48 tests, no
+network.
