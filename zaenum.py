@@ -6,9 +6,14 @@ and attribute each one to the CDN or edge serving it.
 Works for .za second-level domains (co.za, org.za, ...) and for any other
 TLD: a zone is just the name you ask about.
 
-Sources (both public, no API key):
-  ct  Certificate Transparency via crt.sh          (broad, TLS hosts only)
-  cc  Common Crawl URL index                       (paginated, resumable)
+Sources (all public, no API key):
+  ct   Certificate Transparency via crt.sh         (broad, TLS hosts only)
+  cdx  Wayback Machine CDX URL index               (paginated, resumable)
+  cc   Common Crawl URL index                      (paginated, resumable)
+
+A source that fails twice in a row is dropped for the rest of the run instead
+of being retried for every zone, and any zone left incomplete is reported with
+a non-zero exit rather than looking like an empty result.
 
 Everything is written to disk per zone. Re-running resumes where the last
 run stopped instead of re-fetching from the beginning.
@@ -16,7 +21,7 @@ run stopped instead of re-fetching from the beginning.
 Usage
   python3 zaenum.py                                 # interactive console
   python3 zaenum.py --sld all                       # every delegated .za SLD
-  python3 zaenum.py --sld co.za --sources ct,cc
+  python3 zaenum.py --sld co.za --sources ct,cdx,cc
   python3 zaenum.py --sld example.com               # any TLD, not just .za
   python3 zaenum.py --sld law.za --cdn              # tag each host's CDN
   python3 zaenum.py --domains-file zones.txt --cdn
@@ -90,6 +95,8 @@ HOST_RE = re.compile(r"^(?=.{3,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+
 CT_URL = "https://crt.sh/?q={query}&output=json&exclude=expired"
 CC_COLLINFO = "https://index.commoncrawl.org/collinfo.json"
 CC_INDEX = "https://index.commoncrawl.org/{cid}-index?url=*.{sld}&output=json"
+CDX_URL = "https://web.archive.org/cdx/search/cdx"
+SOURCES = ("ct", "cdx", "cc")
 RETRYABLE = {408, 425, 429, 500, 502, 503, 504}
 
 # Public IP-range feeds, used to attribute a host to a CDN edge by address.
@@ -175,18 +182,64 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
 
-def http_get(url: str, timeout: int = 60, delay: float = 1.0, tries: int = 4):
+class SourceHealth:
+    """Drops a source from the run once it has failed repeatedly.
+
+    crt.sh answers 502 for every query while it is down, and the Common Crawl
+    index 504s in bursts. Paying a full retry budget per zone, per source, turns
+    a 17-SLD sweep into an hour of waiting on endpoints that are already known
+    bad. Two exhausted requests are enough to stop asking.
+    """
+
+    def __init__(self, threshold: int = 2):
+        self.threshold = threshold
+        self.streak = {}
+        self.down = {}
+
+    def reset(self) -> None:
+        self.streak.clear()
+        self.down.clear()
+
+    def failure(self, source: str) -> None:
+        if not source:
+            return
+        self.streak[source] = self.streak.get(source, 0) + 1
+        if self.streak[source] >= self.threshold and source not in self.down:
+            self.down[source] = self.streak[source]
+            log(f"  ! {source}: {self.streak[source]} failed requests in a row, "
+                f"dropped for the rest of this run (rerun later to retry it)")
+
+    def success(self, source: str) -> None:
+        if source:
+            self.streak[source] = 0
+
+    def blocked(self, source: str) -> bool:
+        return bool(source) and source in self.down
+
+    def describe(self) -> dict:
+        return dict(self.down)
+
+
+HEALTH = SourceHealth()
+
+
+def http_get(url: str, timeout: int = 60, delay: float = 1.0, tries: int = 4,
+             max_backoff: float = 8.0, source: str = ""):
     """Return (status, body). status is None only when every attempt failed.
 
     Callers must distinguish a real empty answer (200 with `[]`) from a
     transient failure, so nothing is ever marked complete on an error.
     """
+    if HEALTH.blocked(source):
+        return None, b""
+
     last = "unknown error"
     for attempt in range(1, tries + 1):
         req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json, */*"})
         wait = None
         try:
             with urlopen(req, timeout=timeout) as resp:
+                HEALTH.success(source)
                 return resp.status, resp.read()
         except HTTPError as exc:
             last = f"HTTP {exc.code}"
@@ -195,23 +248,31 @@ def http_get(url: str, timeout: int = 60, delay: float = 1.0, tries: int = 4):
                     body = exc.read()
                 except Exception:
                     body = b""
+                # The endpoint answered, it just did not like this request.
+                HEALTH.success(source)
                 return exc.code, body
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
             try:
                 wait = float(retry_after) if retry_after else None
             except (TypeError, ValueError):
                 wait = None
-        except (URLError, TimeoutError, OSError, ValueError) as exc:
+        except (URLError, TimeoutError, OSError, ValueError,
+                http.client.HTTPException) as exc:
+            # IncompleteRead / RemoteDisconnected / BadStatusLine are
+            # HTTPException, NOT OSError. A proxy or CDN cutting a chunked
+            # body short used to escape this handler and abort the whole run
+            # with a traceback; it is just another transient failure.
             last = f"{type(exc).__name__}: {exc}"
 
         if attempt == tries:
             break
-        wait = wait if wait is not None else min(60.0, delay * (2 ** attempt))
+        wait = wait if wait is not None else min(max_backoff, delay * (2 ** attempt))
         wait *= 0.5 + random.random()
         log(f"  retry {attempt}/{tries - 1} in {wait:.1f}s ({last})")
         time.sleep(wait)
 
     log(f"  ! giving up after {tries} tries ({last}): {url}")
+    HEALTH.failure(source)
     return None, b""
 
 
@@ -456,26 +517,37 @@ def ct_hosts(sld: str, state: dict, args) -> list:
     if st.get("complete"):
         log(f"  ct/{sld}: already complete, skipping")
         return []
+    if HEALTH.blocked("ct"):
+        log(f"  ct/{sld}: skipped, crt.sh was dropped for this run")
+        st["status"] = "failed"
+        return []
 
     url = args.ct_url.format(query=quote("%." + sld, safe=""))
     log(f"  ct/{sld}: querying certificate transparency")
-    status, body = http_get(url, timeout=args.timeout, delay=args.delay, tries=args.retries)
+    status, body = http_get(url, timeout=args.timeout, delay=args.delay,
+                            tries=args.retries,
+                            max_backoff=getattr(args, "max_backoff", 8.0),
+                            source="ct")
     if status is None:
         log(f"  ct/{sld}: source unreachable, leaving resumable")
+        st["status"] = "failed"
         return []
     if status != 200:
         # crt.sh answers 502/404 while under load. Never treat that as "empty".
         log(f"  ct/{sld}: HTTP {status}, leaving resumable")
+        st["status"] = "failed"
         return []
 
     try:
         rows = json.loads(body)
     except json.JSONDecodeError:
         log(f"  ct/{sld}: non-JSON response ({len(body)} bytes), not marking complete")
+        st["status"] = "failed"
         return []
 
     if not isinstance(rows, list):
         log(f"  ct/{sld}: unexpected payload shape, not marking complete")
+        st["status"] = "failed"
         return []
 
     found = set()
@@ -488,6 +560,7 @@ def ct_hosts(sld: str, state: dict, args) -> list:
                     found.add(host)
 
     st["complete"] = True
+    st["status"] = "complete"
     st["certificates"] = len(rows)
     log(f"  ct/{sld}: {len(rows)} certificates -> {len(found)} unique hosts")
     return sorted(found)
@@ -508,7 +581,10 @@ def cc_newest_collection(args):
 def cc_page_count(cid: str, sld: str, args):
     """Return (pages, saw_real_answer)."""
     url = CC_INDEX.format(cid=cid, sld=sld) + "&showNumPages=true"
-    status, body = http_get(url, timeout=args.timeout, delay=args.delay, tries=args.retries)
+    status, body = http_get(url, timeout=args.timeout, delay=args.delay,
+                            tries=args.retries,
+                            max_backoff=getattr(args, "max_backoff", 8.0),
+                            source="cc")
     if status != 200:
         return 0, False
     if b"No Captures" in body:
@@ -531,14 +607,20 @@ def cc_hosts(sld: str, state: dict, args, cid: str) -> list:
     if st.get("complete"):
         log(f"  cc/{sld}: already complete, skipping")
         return []
+    if HEALTH.blocked("cc"):
+        log(f"  cc/{sld}: skipped, the Common Crawl index was dropped for this run")
+        st["status"] = "failed"
+        return []
 
     pages, answered = cc_page_count(cid, sld, args)
     if pages <= 0:
         if answered:
             st["complete"] = True
+            st["status"] = "complete"
             log(f"  cc/{sld}: crawl holds no pages for this SLD, marking complete")
         else:
             log(f"  cc/{sld}: index unreachable, leaving resumable")
+            st["status"] = "failed"
         return []
     log(f"  cc/{sld}: {pages} index pages in {cid}, resuming at {st['next_page']}")
 
@@ -547,9 +629,24 @@ def cc_hosts(sld: str, state: dict, args, cid: str) -> list:
         page = st["next_page"]
         url = CC_INDEX.format(cid=cid, sld=sld) + f"&page={page}"
         status, body = http_get(url, timeout=args.timeout, delay=args.delay,
-                                tries=args.retries)
+                                tries=args.retries,
+                                max_backoff=getattr(args, "max_backoff", 8.0),
+                                source="cc")
         if status != 200:
+            if status == 400:
+                # A 400 here means the cursor no longer fits the live index
+                # snapshot (Common Crawl re-shards between crawls). If the
+                # fresh count agrees the cursor is past the end, that is
+                # completion, not failure -- do not throw the zone away.
+                fresh, answered = cc_page_count(cid, sld, args)
+                if answered and page >= fresh:
+                    st["next_page"] = fresh
+                    st["complete"] = True
+                    st["status"] = "complete"
+                    log(f"  cc/{sld}: index now has {fresh} pages, cursor was past the end")
+                    break
             log(f"  cc/{sld}: page {page} failed (HTTP {status}), stopping here to resume later")
+            st["status"] = "failed"
             return sorted(found)
 
         for line in body.splitlines():
@@ -570,7 +667,100 @@ def cc_hosts(sld: str, state: dict, args, cid: str) -> list:
         st["next_page"] = page + 1
         if st["next_page"] >= pages:
             st["complete"] = True
+            st["status"] = "complete"
         log(f"  cc/{sld}: page {page + 1}/{pages}, {len(found)} unique hosts so far")
+        if args.delay:
+            time.sleep(args.delay)
+
+    return sorted(found)
+
+
+CDX_DEFAULT_PAGE_SIZE = 5
+CDX_DEFAULT_MAX_PAGES = 20
+
+
+def cdx_hosts(sld: str, state: dict, args) -> list:
+    """Wayback CDX URL index -- the source that keeps working when crt.sh is out.
+
+    Same shape as the Common Crawl walk: ask how many pages the index has,
+    then fetch one page per request, committing the cursor after each. Without
+    this, a crt.sh outage means every zone's CT pass returns nothing.
+    """
+    st = state.setdefault("cdx", {}).setdefault(sld, {})
+    if st.get("complete"):
+        log(f"  cdx/{sld}: already complete, skipping")
+        return []
+    if HEALTH.blocked("cdx"):
+        log(f"  cdx/{sld}: skipped, web.archive.org was dropped for this run")
+        st["status"] = "failed"
+        return []
+
+    size = max(1, int(getattr(args, "cdx_page_size", CDX_DEFAULT_PAGE_SIZE)))
+    limit = max(0, int(getattr(args, "cdx_max_pages", CDX_DEFAULT_MAX_PAGES)))
+
+    if "pages" not in st:
+        url = f"{CDX_URL}?url=*.{sld}&showNumPages=true&pageSize={size}"
+        status, body = http_get(url, timeout=args.timeout, delay=args.delay,
+                               tries=args.retries,
+                               max_backoff=getattr(args, "max_backoff", 8.0),
+                               source="cdx")
+        if status != 200:
+            log(f"  cdx/{sld}: index unreachable (HTTP {status}), leaving resumable")
+            st["status"] = "failed"
+            return []
+        text = body.decode("utf-8", "replace").strip()
+        if "No Captures" in text:
+            st.update({"pages": 0, "next_page": 0, "complete": True,
+                       "status": "complete"})
+            log(f"  cdx/{sld}: no captures in the Wayback index")
+            return []
+        try:
+            st["pages"] = int(text)
+        except ValueError:
+            log(f"  cdx/{sld}: unexpected page count {text[:40]!r}, not marking complete")
+            st["status"] = "failed"
+            return []
+        st.setdefault("next_page", 0)
+
+    pages = st["pages"]
+    cap = min(pages, limit) if limit else pages
+    if pages > cap:
+        st["capped"] = cap
+    log(f"  cdx/{sld}: {pages} pages at pageSize={size}, resuming at {st['next_page']}"
+        + (f" (capped at {cap} by --cdx-max-pages)" if pages > cap else ""))
+
+    found = set()
+    while st["next_page"] < cap:
+        page = st["next_page"]
+        url = (f"{CDX_URL}?url=*.{sld}&fl=original&collapse=urlkey"
+               f"&filter=!statuscode:404&pageSize={size}&page={page}")
+        status, body = http_get(url, timeout=args.timeout, delay=args.delay,
+                               tries=args.retries,
+                               max_backoff=getattr(args, "max_backoff", 8.0),
+                               source="cdx")
+        if status != 200:
+            log(f"  cdx/{sld}: page {page} failed (HTTP {status}), stopping here to resume later")
+            st["status"] = "failed"
+            return sorted(found)
+
+        for line in body.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("<") or " " in line:
+                continue
+            host = norm_host(urlsplit(line).hostname or "")
+            if host and belongs(host, sld):
+                found.add(host)
+
+        st["next_page"] = page + 1
+        if st["next_page"] >= cap:
+            if pages > cap:
+                # Stopped at the page budget, not the end of the index: stay
+                # resumable so a higher --cdx-max-pages continues from here.
+                st["status"] = "capped"
+            else:
+                st["complete"] = True
+                st["status"] = "complete"
+        log(f"  cdx/{sld}: page {page + 1}/{cap}, {len(found)} unique hosts so far")
         if args.delay:
             time.sleep(args.delay)
 
@@ -765,7 +955,7 @@ def discover(query: str, num_results: int, outdir: str) -> list:
 # --------------------------------------------------------------------------- #
 # interactive menu
 # --------------------------------------------------------------------------- #
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Three-row block wordmark. Each glyph is a fixed width across its three rows,
 # so the assembled rows line up without hand-counting characters.
@@ -786,7 +976,7 @@ MENU_DEFAULTS = {"out": "out", "delay": 1.0, "timeout": 90, "retries": 5,
                  "max_hosts": 0, "cdn_workers": 8, "discover_results": 5}
 
 MENU_ITEMS = (
-    ("01", "enumerate .za SLD", "crt.sh + common crawl for one SLD"),
+    ("01", "enumerate .za SLD", "ct + wayback + crawl for one SLD"),
     ("02", "enumerate any domain", "same pipeline, any TLD"),
     ("03", "enumerate every .za SLD", "all delegated SLDs, resumable"),
     ("04", "CDN attribution only", "zone apex, no enumeration"),
@@ -989,15 +1179,28 @@ def menu_status(out_dir, p) -> bool:
     print(f"\n  {p['bold']}last run{p['reset']} {p['grey']}{summary.get('generated', '?')}"
           f"   aggregate {summary.get('aggregate', 0)} hosts{p['reset']}")
     print(f"  {p['dark']}{'-' * _width()}{p['reset']}")
-    print(f"  {'zone':<24}{'hosts':>8}  {'cdn':<28}")
+    print(f"  {'zone':<18}{'hosts':>8}  {'sources':<22}  {'cdn':<20}")
     for zone in sorted(zones):
         info = zones[zone] or {}
         tallies = info.get("cdn") or {}
         top = ", ".join(f"{name} {count}" for name, count
-                        in sorted(tallies.items(), key=lambda kv: (-kv[1], kv[0]))[:3])
-        print(f"  {zone:<24}{info.get('total', 0):>8}  {top or '-'}")
+                        in sorted(tallies.items(), key=lambda kv: (-kv[1], kv[0]))[:2])
+        # Source state is part of the result: "cdx:cap" means the page budget
+        # stopped the walk, "ct: fai" means crt.sh never answered.
+        marks = " ".join(f"{src}:{status[:3]}"
+                         for src, status in sorted((info.get("sources") or {}).items()))
+        print(f"  {zone:<18}{info.get('total', 0):>8}  {marks:<22}  {top or '-'}")
     if not zones:
         print(f"  {p['grey']}no zones recorded yet{p['reset']}")
+    down = summary.get("sources_down") or {}
+    if down:
+        print(f"\n  {p['amber']}dropped during that run: {', '.join(sorted(down))}"
+              f" -- rerun to retry them{p['reset']}")
+    incomplete = summary.get("incomplete") or []
+    if incomplete:
+        names = ", ".join(row.get("zone", "?") for row in incomplete[:6])
+        more = f" (+{len(incomplete) - 6} more)" if len(incomplete) > 6 else ""
+        print(f"  {p['red']}{len(incomplete)} zone(s) incomplete: {names}{more}{p['reset']}")
     return True
 
 
@@ -1115,8 +1318,8 @@ def parse_args(argv=None):
                         help="a .za SLD or any domain, comma list, or 'all' (default: co.za)")
     parser.add_argument("--domains-file", default="",
                         help="file of zones, one per line (# comments allowed)")
-    parser.add_argument("--sources", default="ct,cc",
-                        help="comma list of ct,cc (default: ct,cc)")
+    parser.add_argument("--sources", default="ct,cdx,cc",
+                        help="comma list of ct,cdx,cc (default: ct,cdx,cc)")
     parser.add_argument("--out", default="out", help="output directory (default: out)")
     parser.add_argument("--max-hosts", type=int, default=0,
                         help="cap new hostnames kept per SLD (0 = no cap)")
@@ -1124,6 +1327,15 @@ def parse_args(argv=None):
                         help="seconds between requests (default: 1.0)")
     parser.add_argument("--timeout", type=int, default=90, help="per-request timeout")
     parser.add_argument("--retries", type=int, default=5, help="attempts per request (default: 5)")
+    parser.add_argument("--max-backoff", type=float, default=8.0,
+                        help="cap on the retry sleep in seconds (default: 8.0)")
+    parser.add_argument("--cdx-max-pages", type=int, default=CDX_DEFAULT_MAX_PAGES,
+                        help="Wayback pages per zone, 0 = every page "
+                             f"(default: {CDX_DEFAULT_MAX_PAGES})")
+    parser.add_argument("--cdx-page-size", type=int, default=CDX_DEFAULT_PAGE_SIZE,
+                        help=f"Wayback page size hint (default: {CDX_DEFAULT_PAGE_SIZE})")
+    parser.add_argument("--allow-partial", action="store_true",
+                        help="exit 0 even when a source failed and zones stayed incomplete")
     parser.add_argument("--ct-url", default=CT_URL,
                         help="override the CT endpoint, keep a {query} placeholder")
     parser.add_argument("--cdn", action="store_true",
@@ -1153,6 +1365,7 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    HEALTH.reset()
     # No flags, or an explicit --menu: the console is the front door. Every
     # action it offers is translated into the same argv a CLI run would use.
     if not argv or argv[0] == "--menu":
@@ -1221,9 +1434,9 @@ def main(argv=None) -> int:
         return 2
 
     sources = [s.strip().lower() for s in args.sources.split(",") if s.strip()]
-    unknown = set(sources) - {"ct", "cc"}
+    unknown = set(sources) - set(SOURCES)
     if unknown or not sources:
-        log(f"bad --sources {args.sources!r} -- use ct,cc")
+        log(f"bad --sources {args.sources!r} -- use {','.join(SOURCES)}")
         return 2
 
     store = Store(args.out)
@@ -1251,10 +1464,18 @@ def main(argv=None) -> int:
 
         collected = []
         if not args.cdn_only:
-            if "ct" in sources:
-                collected.extend(ct_hosts(sld, state, args))
-            if "cc" in sources and cid:
-                collected.extend(cc_hosts(sld, state, args, cid))
+            for source in SOURCES:
+                if source not in sources:
+                    continue
+                if source == "ct":
+                    collected.extend(ct_hosts(sld, state, args))
+                elif source == "cdx":
+                    collected.extend(cdx_hosts(sld, state, args))
+                elif source == "cc":
+                    if cid:
+                        collected.extend(cc_hosts(sld, state, args, cid))
+                    else:
+                        state.setdefault("cc", {}).setdefault(sld, {})["status"] = "failed"
 
         if args.max_hosts > 0:
             unique = sorted(set(collected))
@@ -1268,8 +1489,16 @@ def main(argv=None) -> int:
             total = store.finalize(sld)
             log(f"{sld}: +{added} new, {total} total -> {store.path(sld)}")
         save_state(state_path, state)
+        statuses = {}
+        if not args.cdn_only:
+            for source in sources:
+                entry = state.get(source, {}).get(sld, {})
+                statuses[source] = entry.get("status") or (
+                    "complete" if entry.get("complete") else "pending")
         summary["slds"][sld] = {"new": added, "total": total,
+                                "sources": statuses,
                                 "ct": state.get("ct", {}).get(sld, {}),
+                                "cdx": state.get("cdx", {}).get(sld, {}),
                                 "cc": state.get("cc", {}).get(sld, {})}
 
     if args.cdn:
@@ -1322,8 +1551,29 @@ def main(argv=None) -> int:
             log(f"{sld}: {len(resolved)}/{len(hosts)} resolved -> {path}")
             summary["slds"][sld]["resolved"] = len(resolved)
 
+    # A zone that lost a source is NOT an empty zone. Say so, in the summary and
+    # in the exit status, so a broken upstream cannot pass as "no hostnames".
+    incomplete = []
+    for zone, info in summary["slds"].items():
+        failed = sorted(source for source, status in info.get("sources", {}).items()
+                        if status == "failed")
+        if failed:
+            incomplete.append({"zone": zone, "sources": failed})
+    summary["sources_down"] = HEALTH.describe()
+    summary["incomplete"] = incomplete
+
     with open(os.path.join(args.out, "summary.json"), "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
+
+    if incomplete and not args.cdn_only:
+        log(f"incomplete: {len(incomplete)} of {len(slds)} zone(s) lost a source")
+        for row in incomplete[:12]:
+            log(f"  {row['zone']}: {', '.join(row['sources'])}")
+        if len(incomplete) > 12:
+            log(f"  ... and {len(incomplete) - 12} more")
+        log(f"rerun to resume; per-source detail in {os.path.join(args.out, 'summary.json')}")
+        if not args.allow_partial:
+            return 3
     return 0
 
 
