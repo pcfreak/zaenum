@@ -5,6 +5,7 @@ Run: python3 -m unittest discover -s tests -v
 The transport is faked, so these pass with no network and no rate limits.
 """
 
+import http.client
 import json
 import os
 import sys
@@ -14,6 +15,9 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import zaenum  # noqa: E402
+
+# Captured before any test swaps zaenum.http_get for a scripted transport.
+REAL_HTTP_GET = zaenum.http_get
 
 
 def args(**over):
@@ -30,7 +34,7 @@ class FakeTransport:
         self.routes = routes
         self.calls = []
 
-    def __call__(self, url, timeout=60, delay=1.0, tries=4):
+    def __call__(self, url, timeout=60, delay=1.0, tries=4, max_backoff=8.0, source=""):
         self.calls.append(url)
         for needle, reply in self.routes.items():
             if needle in url:
@@ -145,6 +149,208 @@ class CCTests(unittest.TestCase):
         state = {}
         self.assertEqual(zaenum.cc_hosts("law.za", state, args(), "CC-TEST"), [])
         self.assertFalse(state["cc"]["law.za"].get("complete"))
+
+
+class TransportTests(unittest.TestCase):
+    """A truncated body is a transient failure, never a fatal one."""
+
+    def setUp(self):
+        self.saved = zaenum.urlopen
+        self.saved_get = zaenum.http_get
+        zaenum.http_get = REAL_HTTP_GET
+        zaenum.HEALTH.reset()
+
+    def tearDown(self):
+        zaenum.urlopen = self.saved
+        zaenum.http_get = self.saved_get
+        zaenum.HEALTH.reset()
+
+    def test_truncated_body_is_retried(self):
+        class Resp:
+            status = 200
+
+            def read(self):
+                return b'[{"name_value": "a.co.za"}]'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        calls = {"n": 0}
+
+        def fake(req, timeout=0):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise http.client.IncompleteRead(b"x" * 10, 100)
+            return Resp()
+
+        zaenum.urlopen = fake
+        status, body = zaenum.http_get("http://ct.test/?q=x", delay=0, tries=3, source="ct")
+        self.assertEqual(status, 200)
+        self.assertEqual(calls["n"], 2)
+        self.assertFalse(zaenum.HEALTH.blocked("ct"))
+
+    def test_repeated_truncation_eventually_drops_the_source(self):
+        def fake(req, timeout=0):
+            raise http.client.IncompleteRead(b"", 10)
+
+        zaenum.urlopen = fake
+        self.assertEqual(zaenum.http_get("http://ct.test/?q=x", delay=0, tries=1,
+                                         source="ct"), (None, b""))
+        self.assertFalse(zaenum.HEALTH.blocked("ct"))
+        self.assertEqual(zaenum.http_get("http://ct.test/?q=x", delay=0, tries=1,
+                                         source="ct"), (None, b""))
+        self.assertTrue(zaenum.HEALTH.blocked("ct"))
+
+
+class SourceHealthTests(unittest.TestCase):
+    """A dead endpoint must not be re-queried for every zone in the run."""
+
+    def setUp(self):
+        zaenum.HEALTH.reset()
+
+    def tearDown(self):
+        zaenum.HEALTH.reset()
+
+    def test_two_failures_drop_a_source(self):
+        zaenum.HEALTH.failure("ct")
+        self.assertFalse(zaenum.HEALTH.blocked("ct"))
+        zaenum.HEALTH.failure("ct")
+        self.assertTrue(zaenum.HEALTH.blocked("ct"))
+        self.assertEqual(zaenum.HEALTH.describe(), {"ct": 2})
+
+    def test_any_answer_clears_the_failure_streak(self):
+        zaenum.HEALTH.failure("cc")
+        zaenum.HEALTH.success("cc")
+        zaenum.HEALTH.failure("cc")
+        self.assertFalse(zaenum.HEALTH.blocked("cc"))
+
+    def test_blocked_source_is_skipped_without_a_request(self):
+        zaenum.HEALTH.down["ct"] = 2
+        transport = FakeTransport({"ct.test": (200, b"[]")})
+        zaenum.http_get = transport
+        state = {}
+        self.assertEqual(zaenum.ct_hosts("co.za", state, args()), [])
+        self.assertEqual(transport.calls, [])
+        self.assertFalse(state["ct"]["co.za"].get("complete"))
+        self.assertEqual(state["ct"]["co.za"]["status"], "failed")
+
+
+class CDXTests(unittest.TestCase):
+    """The Wayback walk, which is what keeps a run alive while crt.sh is 502."""
+
+    def setUp(self):
+        zaenum.HEALTH.reset()
+
+    def test_parses_captures_and_marks_complete(self):
+        transport = FakeTransport({
+            "showNumPages=true": (200, b"2"),
+            "&page=0": (200, b"http://www.a.law.za/x\nhttps://b.law.za/y\n"
+                             b"https://evil.example.com/z\n"),
+            "&page=1": (200, b"https://c.law.za/q\n"),
+        })
+        zaenum.http_get = transport
+        state = {}
+        hosts = zaenum.cdx_hosts("law.za", state, args())
+        self.assertEqual(hosts, ["b.law.za", "c.law.za", "www.a.law.za"])
+        self.assertTrue(state["cdx"]["law.za"]["complete"])
+        self.assertEqual(state["cdx"]["law.za"]["status"], "complete")
+        page_calls = [u for u in transport.calls if "&page=" in u]
+        self.assertTrue(page_calls)
+        self.assertTrue(all("pageSize=5" in u for u in page_calls))
+
+    def test_failed_page_keeps_the_cursor(self):
+        routes = {
+            "showNumPages=true": (200, b"3"),
+            "&page=0": (200, b"https://a.law.za\n"),
+            "&page=1": (504, b"timeout"),
+        }
+        zaenum.http_get = FakeTransport(routes)
+        state = {}
+        self.assertEqual(zaenum.cdx_hosts("law.za", state, args()), ["a.law.za"])
+        self.assertEqual(state["cdx"]["law.za"]["next_page"], 1)
+        self.assertFalse(state["cdx"]["law.za"].get("complete"))
+        self.assertEqual(state["cdx"]["law.za"]["status"], "failed")
+
+        routes["&page=1"] = (200, b"https://b.law.za\n")
+        routes["&page=2"] = (200, b"https://c.law.za\n")
+        zaenum.http_get = FakeTransport(routes)
+        self.assertEqual(zaenum.cdx_hosts("law.za", state, args()), ["b.law.za", "c.law.za"])
+        self.assertTrue(state["cdx"]["law.za"]["complete"])
+
+    def test_page_budget_is_reported_not_hidden(self):
+        routes = {"showNumPages=true": (200, b"10")}
+        for page in range(10):
+            routes[f"&page={page}"] = (200, b"https://h%d.law.za\n" % page)
+        zaenum.http_get = FakeTransport(routes)
+        state = {}
+        hosts = zaenum.cdx_hosts("law.za", state, args(cdx_max_pages=2))
+        self.assertEqual(hosts, ["h0.law.za", "h1.law.za"])
+        self.assertEqual(state["cdx"]["law.za"]["status"], "capped")
+        self.assertFalse(state["cdx"]["law.za"].get("complete"))
+        self.assertEqual(state["cdx"]["law.za"]["next_page"], 2)
+
+        # Raising the budget resumes from the cursor instead of restarting.
+        zaenum.http_get = FakeTransport(routes)
+        self.assertEqual(zaenum.cdx_hosts("law.za", state, args(cdx_max_pages=4)),
+                         ["h2.law.za", "h3.law.za"])
+
+    def test_no_captures_marks_complete(self):
+        zaenum.http_get = FakeTransport(
+            {"showNumPages=true": (200, b"No Captures found for: *.law.za")})
+        state = {}
+        self.assertEqual(zaenum.cdx_hosts("law.za", state, args()), [])
+        self.assertTrue(state["cdx"]["law.za"]["complete"])
+
+    def test_unreachable_index_stays_resumable(self):
+        zaenum.http_get = FakeTransport({"showNumPages=true": (502, b"bad gateway")})
+        state = {}
+        self.assertEqual(zaenum.cdx_hosts("law.za", state, args()), [])
+        self.assertFalse(state["cdx"]["law.za"].get("complete"))
+        self.assertEqual(state["cdx"]["law.za"]["status"], "failed")
+
+
+class IncompleteRunTests(unittest.TestCase):
+    """A source outage must not look like a zone with no hostnames."""
+
+    def run_main(self, status, extra=None):
+        tmp = tempfile.mkdtemp()
+        original = zaenum.ct_hosts
+
+        def fake_ct(sld, state, args):
+            state.setdefault("ct", {}).setdefault(sld, {})["status"] = status
+            return [f"a.{sld}"] if status == "complete" else []
+
+        zaenum.ct_hosts = fake_ct
+        try:
+            code = zaenum.main(["--sld", "law.za", "--sources", "ct",
+                                "--out", tmp] + (extra or []))
+        finally:
+            zaenum.ct_hosts = original
+        with open(os.path.join(tmp, "summary.json")) as handle:
+            return code, json.load(handle)
+
+    def test_failed_source_exits_three_and_names_the_zone(self):
+        code, payload = self.run_main("failed")
+        self.assertEqual(code, 3)
+        self.assertEqual(payload["incomplete"], [{"zone": "law.za", "sources": ["ct"]}])
+
+    def test_allow_partial_opts_into_a_zero_exit(self):
+        code, payload = self.run_main("failed", ["--allow-partial"])
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["incomplete"], [{"zone": "law.za", "sources": ["ct"]}])
+
+    def test_complete_run_exits_zero_with_no_complaints(self):
+        code, payload = self.run_main("complete")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["incomplete"], [])
+        self.assertEqual(payload["slds"]["law.za"]["sources"], {"ct": "complete"})
+
+    def test_unknown_source_is_rejected(self):
+        self.assertEqual(zaenum.main(["--sources", "nope", "--sld", "law.za"]), 2)
+        self.assertIn("cdx", zaenum.SOURCES)
 
 
 class CdnTests(unittest.TestCase):
